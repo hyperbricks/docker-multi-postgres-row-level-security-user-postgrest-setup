@@ -52,10 +52,9 @@ CREATE POLICY tasks_select_policy ON tasks
 
 CREATE POLICY tasks_insert_policy ON tasks
   FOR INSERT
-  WITH CHECK (
-    owner_id = current_setting('request.jwt.claims', true)::json->>'sub'
-    OR owner_id IS NULL
-  );
+    WITH CHECK (
+        owner_id = ((current_setting('request.jwt.claims', true))::json ->> 'sub')
+    );
 
 CREATE POLICY tasks_update_policy ON tasks
   FOR UPDATE
@@ -64,8 +63,7 @@ CREATE POLICY tasks_update_policy ON tasks
 
 CREATE POLICY tasks_delete_policy ON tasks
   FOR DELETE
-  USING (owner_id = current_setting('request.jwt.claims', true)::json->>'sub');
-
+  USING (owner_id = current_setting('request.jwt.claims', true)::json->>'sub');cl
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON tasks TO authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON tasks TO web_anon;
@@ -248,3 +246,73 @@ $$;
 REVOKE ALL ON FUNCTION login_user(p_password TEXT, p_username TEXT) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION login_user(p_password TEXT, p_username TEXT) TO web_anon;
 GRANT EXECUTE ON FUNCTION login_user(p_password TEXT, p_username TEXT) TO authenticated;
+
+
+
+-- ==================================================================================================================
+-- 7) login_with_user_data function to generate a JWT token and userdata
+-- ==================================================================================================================
+CREATE OR REPLACE FUNCTION login_with_user_data(p_username TEXT, p_password TEXT)
+RETURNS JSON
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp  -- restrict search_path for security
+AS $$
+DECLARE
+    user_rec RECORD;
+    jwt_token TEXT;
+    role_claim TEXT;
+BEGIN
+    -- Validate the username and password using crypt()
+    SELECT id, username, email
+      INTO user_rec
+      FROM users
+     WHERE username = p_username
+       AND password = crypt(p_password, password);
+
+    IF NOT FOUND THEN
+        -- Return 401 if credentials are invalid
+        RETURN json_build_object(
+            'status', 401,
+            'user', NULL,
+            'token', NULL
+        );
+    END IF;
+
+    -- Assign role based on the username
+    IF user_rec.username = 'postgres' THEN
+        role_claim := 'admin';
+    ELSE
+        role_claim := 'user';
+    END IF;
+
+    -- Generate the JWT token using json_build_object to create the payload
+    jwt_token := sign(
+        json_build_object(
+            'id', user_rec.id,
+            'username', user_rec.username,
+            'email', user_rec.email,
+            'role', role_claim,
+            'exp', extract(epoch FROM now())::integer + 3600  -- expires in 1 hour
+        ),
+        'a-string-secret-at-least-256-bits-long'
+    -- or: current_setting('app.jwt_secret')
+    );
+
+    -- Return a JSON object containing the status, user info, and token
+    RETURN json_build_object(
+        'status', 201,
+        'user', json_build_object(
+                    'id', user_rec.id,
+                    'username', user_rec.username,
+                    'email', user_rec.email
+                ),
+        'token', jwt_token
+    );
+END;
+$$;
+
+-- Revoke from PUBLIC, then grant to roles that should be able to login
+REVOKE ALL ON FUNCTION login_with_user_data(p_password TEXT, p_username TEXT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION login_with_user_data(p_password TEXT, p_username TEXT) TO web_anon;
+GRANT EXECUTE ON FUNCTION login_with_user_data(p_password TEXT, p_username TEXT) TO authenticated;
